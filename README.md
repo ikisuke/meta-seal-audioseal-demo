@@ -53,8 +53,9 @@ uv run audioseal-web --port 8777
 
 Each web run is written into `outputs/web/` with media files and `results.json`.
 The video path runs VideoSeal on CPU, so the first run can be slow while the
-model loads. The web app uses a short 16:9 sample and skips the heavier MP4
-readback detector by default to keep the UI usable.
+model loads. The web app uses a short 16:9 sample, the default low-strength
+VideoSeal setting, and skips the heavier MP4 readback detector by default to
+keep the UI usable and preserve visual quality.
 
 On Windows CPU environments this demo sets `NO_TORCH_COMPILE=1` before importing
 AudioSeal. Without that, PyTorch may try to compile kernels and fail if the MSVC

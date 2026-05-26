@@ -36,6 +36,7 @@ from .cli import (
 APP_DIR = Path(__file__).resolve().parents[2]
 WEB_OUTPUT_DIR = APP_DIR / "outputs" / "web"
 MAX_UPLOAD_SECONDS = 20
+VIDEO_WATERMARK_STRENGTH = 0.2
 _GENERATOR: torch.nn.Module | None = None
 _DETECTOR: torch.nn.Module | None = None
 _VIDEO_MODEL: torch.nn.Module | None = None
@@ -204,7 +205,7 @@ def process_video_tensor(video: torch.Tensor, label: str) -> dict[str, Any]:
 
     with torch.inference_mode():
         model = get_video_model()
-        model.blender.scaling_w = 1.0
+        model.blender.scaling_w = VIDEO_WATERMARK_STRENGTH
         outputs = model.embed(video, is_video=True)
         watermarked = outputs["imgs_w"].clamp(0, 1)
         target_message = outputs["msgs"][0]
@@ -219,7 +220,7 @@ def process_video_tensor(video: torch.Tensor, label: str) -> dict[str, Any]:
         "run_id": run_id,
         "frame_count": int(video.shape[0]),
         "resolution": [int(video.shape[-1]), int(video.shape[-2])],
-        "video_scaling_w": 1.0,
+        "video_scaling_w": VIDEO_WATERMARK_STRENGTH,
         "message_bits": target_message.detach().cpu().int().tolist(),
         "watermark_rmse": round(float(l2_delta), 6),
         "clean": {"note": "Clean-video detection is skipped in the fast web path."},
