@@ -8,7 +8,10 @@ __pycache__/
 
 # AudioSeal model checkpoints are downloaded by the library.
 .cache/
+ckpts/
 
 # Runtime files from the web app.
 outputs/web/
 outputs/web-demo-screenshot.png
+outputs/web-video-screenshot.png
+outputs/tmp_strength*.mp4

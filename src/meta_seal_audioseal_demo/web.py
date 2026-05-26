@@ -4,6 +4,8 @@ import argparse
 import io
 import json
 import os
+import shutil
+import subprocess
 import uuid
 from pathlib import Path
 from typing import Any
@@ -36,6 +38,7 @@ WEB_OUTPUT_DIR = APP_DIR / "outputs" / "web"
 MAX_UPLOAD_SECONDS = 20
 _GENERATOR: torch.nn.Module | None = None
 _DETECTOR: torch.nn.Module | None = None
+_VIDEO_MODEL: torch.nn.Module | None = None
 
 
 def app_factory() -> FastAPI:
@@ -65,6 +68,26 @@ def app_factory() -> FastAPI:
 
         return process_waveform(wav, Path(file.filename).stem or "upload")
 
+    @app.post("/api/video-sample")
+    def video_sample() -> dict[str, Any]:
+        video = build_video_sample()
+        return process_video_tensor(video, "video-sample")
+
+    @app.post("/api/video-upload")
+    async def video_upload(file: UploadFile = File(...)) -> dict[str, Any]:
+        if not file.filename:
+            raise HTTPException(status_code=400, detail="Choose a video file.")
+
+        data = await file.read()
+        source = WEB_OUTPUT_DIR / f"upload-{uuid.uuid4().hex[:8]}-{safe_stem(file.filename)}"
+        source.write_bytes(data)
+        try:
+            video = mp4_to_video_tensor(source)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Could not read video: {exc}") from exc
+
+        return process_video_tensor(video, Path(file.filename).stem or "video")
+
     return app
 
 
@@ -75,6 +98,24 @@ def get_models() -> tuple[torch.nn.Module, torch.nn.Module]:
     if _DETECTOR is None:
         _DETECTOR = AudioSeal.load_detector("audioseal_detector_16bits").eval()
     return _GENERATOR, _DETECTOR
+
+
+def get_video_model() -> torch.nn.Module:
+    global _VIDEO_MODEL
+    if _VIDEO_MODEL is not None:
+        return _VIDEO_MODEL
+    try:
+        import importlib.resources as resources
+        import videoseal
+    except ModuleNotFoundError as exc:
+        raise HTTPException(
+            status_code=501,
+            detail="Video support is not installed. Run: uv sync --extra video",
+        ) from exc
+
+    card = resources.files("videoseal") / "cards" / "videoseal_1.0.yaml"
+    _VIDEO_MODEL = videoseal.load(card).eval()
+    return _VIDEO_MODEL
 
 
 def bytes_to_waveform(data: bytes) -> torch.Tensor:
@@ -114,6 +155,7 @@ def process_waveform(clean: torch.Tensor, label: str) -> dict[str, Any]:
         noise = watermarked - clean
         snr_db = 10 * torch.log10(torch.mean(clean**2).clamp_min(1e-12) / torch.mean(noise**2).clamp_min(1e-12))
         results = {
+            "kind": "audio",
             "run_id": run_id,
             "duration_seconds": round(clean.shape[-1] / SAMPLE_RATE, 3),
             "message_bits": MESSAGE_BITS,
@@ -141,6 +183,163 @@ def process_waveform(clean: torch.Tensor, label: str) -> dict[str, Any]:
     return results
 
 
+def build_video_sample(frame_count: int = 16, height: int = 128, width: int = 128) -> torch.Tensor:
+    xs = torch.linspace(0, 1, width).view(1, width).expand(height, width)
+    ys = torch.linspace(0, 1, height).view(height, 1).expand(height, width)
+    frames = []
+    for index in range(frame_count):
+        phase = index / frame_count
+        ring = torch.sin((xs - 0.5 + phase * 0.4) ** 2 * 18 + (ys - 0.5) ** 2 * 18)
+        red = (xs + phase).remainder(1)
+        green = (ys * 0.75 + 0.25 * ring).clamp(0, 1)
+        blue = ((xs - ys).abs() + phase * 0.55).remainder(1)
+        frames.append(torch.stack([red, green, blue], dim=0))
+    return torch.stack(frames, dim=0).float()
+
+
+def process_video_tensor(video: torch.Tensor, label: str) -> dict[str, Any]:
+    run_id = f"{safe_stem(label)}-{uuid.uuid4().hex[:8]}"
+    run_dir = WEB_OUTPUT_DIR / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    with torch.inference_mode():
+        model = get_video_model()
+        model.blender.scaling_w = 1.0
+        outputs = model.embed(video, is_video=True)
+        watermarked = outputs["imgs_w"].clamp(0, 1)
+        target_message = outputs["msgs"][0]
+        clean_detection = detect_video_bits(model, video, target_message)
+        watermarked_detection = detect_video_bits(model, watermarked, target_message)
+
+    tensor_to_mp4(run_dir / "clean.mp4", video)
+    tensor_to_mp4(run_dir / "watermarked.mp4", watermarked)
+
+    try:
+        compressed = mp4_to_video_tensor(run_dir / "watermarked.mp4", max_frames=video.shape[0])
+        with torch.inference_mode():
+            compressed_detection = detect_video_bits(model, compressed, target_message)
+    except Exception as exc:
+        compressed_detection = {"error": str(exc)}
+
+    l2_delta = torch.mean((watermarked - video) ** 2).sqrt()
+    results = {
+        "kind": "video",
+        "run_id": run_id,
+        "frame_count": int(video.shape[0]),
+        "resolution": [int(video.shape[-1]), int(video.shape[-2])],
+        "video_scaling_w": 1.0,
+        "message_bits": target_message.detach().cpu().int().tolist(),
+        "watermark_rmse": round(float(l2_delta), 6),
+        "clean": clean_detection,
+        "watermarked": watermarked_detection,
+        "watermarked_mp4_readback": compressed_detection,
+        "video": {
+            "clean": f"/outputs/web/{run_id}/clean.mp4",
+            "watermarked": f"/outputs/web/{run_id}/watermarked.mp4",
+            "results": f"/outputs/web/{run_id}/results.json",
+        },
+    }
+    (run_dir / "results.json").write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
+    return results
+
+
+def detect_video_bits(
+    model: torch.nn.Module,
+    video: torch.Tensor,
+    target_message: torch.Tensor | None = None,
+) -> dict[str, Any]:
+    decoded = model.extract_message(video, aggregation="avg")[0]
+    decoded_bits = decoded.int()
+    result = {
+        "decoded_message_first_32": decoded_bits[:32].detach().cpu().tolist(),
+        "ones_ratio": round(float(decoded_bits.float().mean()), 6),
+    }
+    if target_message is not None:
+        target_bits = (target_message > 0).int()
+        bit_accuracy = (decoded_bits == target_bits).float().mean()
+        result["bit_accuracy"] = round(float(bit_accuracy), 6)
+        result["matching_bits"] = int((decoded_bits == target_bits).sum())
+        result["total_bits"] = int(target_bits.numel())
+    return result
+
+
+def mp4_to_video_tensor(path: Path, max_frames: int = 32, size: int = 128) -> torch.Tensor:
+    try:
+        import cv2
+    except ModuleNotFoundError as exc:
+        raise HTTPException(
+            status_code=501,
+            detail="Video support is not installed. Run: uv sync --extra video",
+        ) from exc
+
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        raise ValueError("OpenCV could not open this video.")
+
+    frames = []
+    while len(frames) < max_frames:
+        ok, frame = capture.read()
+        if not ok:
+            break
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = cv2.resize(frame, (size, size), interpolation=cv2.INTER_AREA)
+        frames.append(torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0)
+    capture.release()
+
+    if not frames:
+        raise ValueError("No frames were decoded.")
+    return torch.stack(frames, dim=0)
+
+
+def tensor_to_mp4(path: Path, video: torch.Tensor, fps: int = 8) -> None:
+    try:
+        import cv2
+    except ModuleNotFoundError as exc:
+        raise HTTPException(
+            status_code=501,
+            detail="Video support is not installed. Run: uv sync --extra video",
+        ) from exc
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(".tmp.mp4")
+    frames = (video.detach().cpu().clamp(0, 1) * 255).byte()
+    height, width = int(frames.shape[-2]), int(frames.shape[-1])
+    writer = cv2.VideoWriter(str(tmp_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    if not writer.isOpened():
+        raise ValueError("OpenCV could not create the output video.")
+    for frame in frames:
+        rgb = frame.permute(1, 2, 0).numpy()
+        writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+    writer.release()
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        subprocess.run(
+            [
+                ffmpeg,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(tmp_path),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "12",
+                "-pix_fmt",
+                "yuv420p",
+                str(path),
+            ],
+            check=True,
+        )
+        tmp_path.unlink(missing_ok=True)
+    else:
+        tmp_path.replace(path)
+
+
 def safe_stem(value: str) -> str:
     cleaned = "".join(ch.lower() if ch.isalnum() else "-" for ch in value)
     cleaned = "-".join(part for part in cleaned.split("-") if part)
@@ -161,7 +360,7 @@ HTML = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Meta Seal AudioSeal Demo</title>
+  <title>Meta Seal Media Demo</title>
   <style>
     :root {
       color-scheme: light;
@@ -210,7 +409,7 @@ HTML = """
     }
     .controls {
       display: grid;
-      grid-template-columns: 1fr 1fr;
+      grid-template-columns: repeat(3, 1fr);
       gap: 14px;
       margin-bottom: 16px;
     }
@@ -321,21 +520,29 @@ HTML = """
       background: var(--good);
     }
     .score-row[data-low="true"] .bar span { background: var(--warn); }
-    audio {
+    audio, video {
       width: 100%;
+    }
+    audio {
       height: 42px;
     }
-    .audio-grid {
+    video {
+      border-radius: 6px;
+      background: #111827;
+      aspect-ratio: 1 / 1;
+      object-fit: contain;
+    }
+    .media-grid {
       display: grid;
       gap: 12px;
     }
-    .audio-item {
+    .media-item {
       border: 1px solid var(--line);
       border-radius: 8px;
       padding: 12px;
       background: white;
     }
-    .audio-item h3 {
+    .media-item h3 {
       font-size: 14px;
       margin: 0 0 8px;
     }
@@ -386,8 +593,8 @@ HTML = """
   <main>
     <header>
       <div>
-        <h1>Meta Seal AudioSeal Demo</h1>
-        <p>Embed an invisible watermark into audio, then verify how strongly the detector sees it after noise, resampling, and cropping.</p>
+        <h1>Meta Seal Media Demo</h1>
+        <p>Run AudioSeal for audio and VideoSeal for short video clips from the same local app.</p>
       </div>
       <button id="sampleBtn">Run sample audio</button>
     </header>
@@ -406,25 +613,35 @@ HTML = """
           <button class="secondary" id="uploadBtn" type="submit">Watermark upload</button>
         </form>
       </div>
+      <div class="panel">
+        <h2>Video</h2>
+        <form id="videoUploadForm" class="row">
+          <button id="videoSampleBtn" type="button">Run sample video</button>
+          <label class="file-label" for="videoFile">Choose video</label>
+          <input id="videoFile" name="file" type="file" accept="video/*,.mp4,.mov,.webm">
+          <span id="videoFileName" class="filename">No file selected</span>
+          <button class="secondary" id="videoUploadBtn" type="submit">Watermark video</button>
+        </form>
+      </div>
     </section>
 
-    <div id="status" class="status">Ready. First run may take a few seconds while AudioSeal loads the model.</div>
+    <div id="status" class="status">Ready. First run may take a few seconds while the model loads.</div>
 
     <section id="results" class="results hidden">
       <div class="panel">
         <h2>Detection</h2>
         <div class="metric-grid">
-          <div class="metric"><strong id="scoreWatermarked">-</strong><span>watermarked score</span></div>
-          <div class="metric"><strong id="scoreClean">-</strong><span>clean score</span></div>
-          <div class="metric"><strong id="snr">-</strong><span>watermark SNR</span></div>
+          <div class="metric"><strong id="metricPrimary">-</strong><span id="metricPrimaryLabel">watermarked score</span></div>
+          <div class="metric"><strong id="metricSecondary">-</strong><span id="metricSecondaryLabel">clean score</span></div>
+          <div class="metric"><strong id="metricTertiary">-</strong><span id="metricTertiaryLabel">watermark SNR</span></div>
         </div>
         <div id="scoreList" class="score-list"></div>
         <div id="bits" class="bits"></div>
       </div>
 
       <div class="panel">
-        <h2>Audio outputs</h2>
-        <div id="audioGrid" class="audio-grid"></div>
+        <h2 id="mediaHeading">Audio outputs</h2>
+        <div id="mediaGrid" class="media-grid"></div>
         <pre id="jsonOut"></pre>
       </div>
     </section>
@@ -434,8 +651,13 @@ HTML = """
     const sampleBtn = document.getElementById("sampleBtn");
     const uploadForm = document.getElementById("uploadForm");
     const uploadBtn = document.getElementById("uploadBtn");
+    const videoSampleBtn = document.getElementById("videoSampleBtn");
+    const videoUploadForm = document.getElementById("videoUploadForm");
+    const videoUploadBtn = document.getElementById("videoUploadBtn");
     const audioFile = document.getElementById("audioFile");
+    const videoFile = document.getElementById("videoFile");
     const fileName = document.getElementById("fileName");
+    const videoFileName = document.getElementById("videoFileName");
     const statusBox = document.getElementById("status");
     const resultsEl = document.getElementById("results");
 
@@ -443,8 +665,16 @@ HTML = """
       fileName.textContent = audioFile.files[0]?.name || "No file selected";
     });
 
+    videoFile.addEventListener("change", () => {
+      videoFileName.textContent = videoFile.files[0]?.name || "No file selected";
+    });
+
     sampleBtn.addEventListener("click", async () => {
-      await callApi("/api/sample", { method: "POST" });
+      await callApi("/api/sample", { method: "POST" }, "Running AudioSeal on CPU.");
+    });
+
+    videoSampleBtn.addEventListener("click", async () => {
+      await callApi("/api/video-sample", { method: "POST" }, "Running VideoSeal on CPU.");
     });
 
     uploadForm.addEventListener("submit", async (event) => {
@@ -455,12 +685,23 @@ HTML = """
       }
       const form = new FormData();
       form.append("file", audioFile.files[0]);
-      await callApi("/api/upload", { method: "POST", body: form });
+      await callApi("/api/upload", { method: "POST", body: form }, "Running AudioSeal on CPU.");
     });
 
-    async function callApi(url, options) {
+    videoUploadForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (!videoFile.files[0]) {
+        setStatus("Choose a video file first.", true);
+        return;
+      }
+      const form = new FormData();
+      form.append("file", videoFile.files[0]);
+      await callApi("/api/video-upload", { method: "POST", body: form }, "Running VideoSeal on CPU.");
+    });
+
+    async function callApi(url, options, busyText) {
       setBusy(true);
-      setStatus("Running AudioSeal. This can take a moment on CPU.", false);
+      setStatus(`${busyText} This can take a moment.`, false);
       try {
         const response = await fetch(url, options);
         const data = await response.json();
@@ -477,6 +718,8 @@ HTML = """
     function setBusy(value) {
       sampleBtn.disabled = value;
       uploadBtn.disabled = value;
+      videoSampleBtn.disabled = value;
+      videoUploadBtn.disabled = value;
     }
 
     function setStatus(message, isError) {
@@ -487,9 +730,21 @@ HTML = """
 
     function render(data) {
       resultsEl.classList.remove("hidden");
-      document.getElementById("scoreWatermarked").textContent = fmt(data.watermarked.score);
-      document.getElementById("scoreClean").textContent = fmt(data.clean.score);
-      document.getElementById("snr").textContent = `${data.watermark_snr_db} dB`;
+      if (data.kind === "video") {
+        renderVideo(data);
+      } else {
+        renderAudio(data);
+      }
+      document.getElementById("jsonOut").textContent = JSON.stringify(data, null, 2);
+    }
+
+    function renderAudio(data) {
+      document.getElementById("metricPrimary").textContent = fmt(data.watermarked.score);
+      document.getElementById("metricPrimaryLabel").textContent = "watermarked score";
+      document.getElementById("metricSecondary").textContent = fmt(data.clean.score);
+      document.getElementById("metricSecondaryLabel").textContent = "clean score";
+      document.getElementById("metricTertiary").textContent = `${data.watermark_snr_db} dB`;
+      document.getElementById("metricTertiaryLabel").textContent = "watermark SNR";
 
       const scoreList = document.getElementById("scoreList");
       scoreList.innerHTML = "";
@@ -516,8 +771,9 @@ HTML = """
         bits.appendChild(item);
       });
 
-      const audioGrid = document.getElementById("audioGrid");
-      audioGrid.innerHTML = "";
+      document.getElementById("mediaHeading").textContent = "Audio outputs";
+      const mediaGrid = document.getElementById("mediaGrid");
+      mediaGrid.innerHTML = "";
       [
         ["Clean input", data.audio.clean],
         ["Watermarked", data.audio.watermarked],
@@ -525,16 +781,63 @@ HTML = """
         ["Watermarked resampled", data.audio.watermarked_resampled],
       ].forEach(([label, src]) => {
         const item = document.createElement("div");
-        item.className = "audio-item";
+        item.className = "media-item";
         item.innerHTML = `<h3>${label}</h3><audio controls src="${src}"></audio>`;
-        audioGrid.appendChild(item);
+        mediaGrid.appendChild(item);
+      });
+    }
+
+    function renderVideo(data) {
+      document.getElementById("metricPrimary").textContent = percent(data.watermarked.bit_accuracy);
+      document.getElementById("metricPrimaryLabel").textContent = "watermarked bit match";
+      document.getElementById("metricSecondary").textContent = percent(data.clean.bit_accuracy || 0);
+      document.getElementById("metricSecondaryLabel").textContent = "clean bit match";
+      document.getElementById("metricTertiary").textContent = data.watermark_rmse;
+      document.getElementById("metricTertiaryLabel").textContent = "watermark RMSE";
+
+      const scoreList = document.getElementById("scoreList");
+      scoreList.innerHTML = "";
+      [
+        ["Clean", data.clean.bit_accuracy || 0],
+        ["Watermarked", data.watermarked.bit_accuracy],
+        ["MP4 readback", data.watermarked_mp4_readback.bit_accuracy || 0],
+      ].forEach(([label, score]) => {
+        const row = document.createElement("div");
+        row.className = "score-row";
+        row.dataset.low = score < 0.8;
+        row.innerHTML = `<span>${label}</span><div class="bar"><span style="width:${Math.max(0, Math.min(1, score)) * 100}%"></span></div><strong>${percent(score)}</strong>`;
+        scoreList.appendChild(row);
       });
 
-      document.getElementById("jsonOut").textContent = JSON.stringify(data, null, 2);
+      const bits = document.getElementById("bits");
+      bits.innerHTML = "";
+      data.watermarked.decoded_message_first_32.forEach((bit) => {
+        const item = document.createElement("span");
+        item.className = `bit ${bit ? "one" : ""}`;
+        item.textContent = bit;
+        bits.appendChild(item);
+      });
+
+      document.getElementById("mediaHeading").textContent = "Video outputs";
+      const mediaGrid = document.getElementById("mediaGrid");
+      mediaGrid.innerHTML = "";
+      [
+        ["Clean input", data.video.clean],
+        ["Watermarked", data.video.watermarked],
+      ].forEach(([label, src]) => {
+        const item = document.createElement("div");
+        item.className = "media-item";
+        item.innerHTML = `<h3>${label}</h3><video controls muted loop src="${src}"></video>`;
+        mediaGrid.appendChild(item);
+      });
     }
 
     function fmt(value) {
       return Number(value).toFixed(3);
+    }
+
+    function percent(value) {
+      return `${Math.round(Number(value) * 100)}%`;
     }
   </script>
 </body>

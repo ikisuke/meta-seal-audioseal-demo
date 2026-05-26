@@ -43,8 +43,15 @@ uv run audioseal-web --port 8777
 ```
 
 Then open <http://127.0.0.1:8777>. The app lets you run the bundled synthetic
-sample or upload a short audio file. It writes each run into `outputs/web/` with
-the clean, watermarked, noisy, resampled, and JSON result files.
+audio sample, upload a short audio file, or run a short synthetic VideoSeal
+sample. Video support is optional because it pulls heavier dependencies:
+
+```powershell
+uv sync --extra video
+uv run audioseal-web --port 8777
+```
+
+Each web run is written into `outputs/web/` with media files and `results.json`.
 
 On Windows CPU environments this demo sets `NO_TORCH_COMPILE=1` before importing
 AudioSeal. Without that, PyTorch may try to compile kernels and fail if the MSVC

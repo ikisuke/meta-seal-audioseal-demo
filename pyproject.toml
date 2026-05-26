@@ -13,6 +13,13 @@ dependencies = [
     "uvicorn[standard]>=0.38.0",
 ]
 
+[project.optional-dependencies]
+video = [
+    "opencv-python>=4.13.0.92",
+    "requests>=2.34.2",
+    "videoseal==1.0.1",
+]
+
 [project.scripts]
 audioseal-demo = "meta_seal_audioseal_demo:main"
 audioseal-web = "meta_seal_audioseal_demo.web:main"
