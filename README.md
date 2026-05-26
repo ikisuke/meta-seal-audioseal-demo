@@ -35,6 +35,17 @@ uv sync
 uv run audioseal-demo
 ```
 
+## Web app
+
+```powershell
+uv sync
+uv run audioseal-web --port 8777
+```
+
+Then open <http://127.0.0.1:8777>. The app lets you run the bundled synthetic
+sample or upload a short audio file. It writes each run into `outputs/web/` with
+the clean, watermarked, noisy, resampled, and JSON result files.
+
 On Windows CPU environments this demo sets `NO_TORCH_COMPILE=1` before importing
 AudioSeal. Without that, PyTorch may try to compile kernels and fail if the MSVC
 `cl` compiler is not installed.

@@ -4,6 +4,11 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+*.log
 
 # AudioSeal model checkpoints are downloaded by the library.
 .cache/
+
+# Runtime files from the web app.
+outputs/web/
+outputs/web-demo-screenshot.png

@@ -6,12 +6,16 @@ readme = "README.md"
 requires-python = ">=3.10,<3.11"
 dependencies = [
     "audioseal==0.2.0",
+    "fastapi>=0.121.0",
+    "python-multipart>=0.0.20",
     "scipy>=1.15.3",
     "soundfile>=0.13.1",
+    "uvicorn[standard]>=0.38.0",
 ]
 
 [project.scripts]
 audioseal-demo = "meta_seal_audioseal_demo:main"
+audioseal-web = "meta_seal_audioseal_demo.web:main"
 
 [build-system]
 requires = ["hatchling"]
