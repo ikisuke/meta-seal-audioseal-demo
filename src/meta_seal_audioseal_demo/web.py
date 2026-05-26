@@ -183,7 +183,7 @@ def process_waveform(clean: torch.Tensor, label: str) -> dict[str, Any]:
     return results
 
 
-def build_video_sample(frame_count: int = 16, height: int = 128, width: int = 128) -> torch.Tensor:
+def build_video_sample(frame_count: int = 2, height: int = 144, width: int = 256) -> torch.Tensor:
     xs = torch.linspace(0, 1, width).view(1, width).expand(height, width)
     ys = torch.linspace(0, 1, height).view(height, 1).expand(height, width)
     frames = []
@@ -208,18 +208,10 @@ def process_video_tensor(video: torch.Tensor, label: str) -> dict[str, Any]:
         outputs = model.embed(video, is_video=True)
         watermarked = outputs["imgs_w"].clamp(0, 1)
         target_message = outputs["msgs"][0]
-        clean_detection = detect_video_bits(model, video, target_message)
         watermarked_detection = detect_video_bits(model, watermarked, target_message)
 
     tensor_to_mp4(run_dir / "clean.mp4", video)
     tensor_to_mp4(run_dir / "watermarked.mp4", watermarked)
-
-    try:
-        compressed = mp4_to_video_tensor(run_dir / "watermarked.mp4", max_frames=video.shape[0])
-        with torch.inference_mode():
-            compressed_detection = detect_video_bits(model, compressed, target_message)
-    except Exception as exc:
-        compressed_detection = {"error": str(exc)}
 
     l2_delta = torch.mean((watermarked - video) ** 2).sqrt()
     results = {
@@ -230,9 +222,9 @@ def process_video_tensor(video: torch.Tensor, label: str) -> dict[str, Any]:
         "video_scaling_w": 1.0,
         "message_bits": target_message.detach().cpu().int().tolist(),
         "watermark_rmse": round(float(l2_delta), 6),
-        "clean": clean_detection,
+        "clean": {"note": "Clean-video detection is skipped in the fast web path."},
         "watermarked": watermarked_detection,
-        "watermarked_mp4_readback": compressed_detection,
+        "watermarked_mp4_readback": {"note": "MP4 readback detection is skipped in the fast web path."},
         "video": {
             "clean": f"/outputs/web/{run_id}/clean.mp4",
             "watermarked": f"/outputs/web/{run_id}/watermarked.mp4",
@@ -263,7 +255,7 @@ def detect_video_bits(
     return result
 
 
-def mp4_to_video_tensor(path: Path, max_frames: int = 32, size: int = 128) -> torch.Tensor:
+def mp4_to_video_tensor(path: Path, max_frames: int = 32, max_side: int = 512) -> torch.Tensor:
     try:
         import cv2
     except ModuleNotFoundError as exc:
@@ -282,7 +274,12 @@ def mp4_to_video_tensor(path: Path, max_frames: int = 32, size: int = 128) -> to
         if not ok:
             break
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame = cv2.resize(frame, (size, size), interpolation=cv2.INTER_AREA)
+        height, width = frame.shape[:2]
+        scale = min(1.0, max_side / max(height, width))
+        out_width = max(2, int(round(width * scale / 2) * 2))
+        out_height = max(2, int(round(height * scale / 2) * 2))
+        if (out_width, out_height) != (width, height):
+            frame = cv2.resize(frame, (out_width, out_height), interpolation=cv2.INTER_AREA)
         frames.append(torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0)
     capture.release()
 
@@ -328,7 +325,7 @@ def tensor_to_mp4(path: Path, video: torch.Tensor, fps: int = 8) -> None:
                 "-preset",
                 "veryfast",
                 "-crf",
-                "12",
+                "8",
                 "-pix_fmt",
                 "yuv420p",
                 str(path),
@@ -529,7 +526,6 @@ HTML = """
     video {
       border-radius: 6px;
       background: #111827;
-      aspect-ratio: 1 / 1;
       object-fit: contain;
     }
     .media-grid {
@@ -790,17 +786,15 @@ HTML = """
     function renderVideo(data) {
       document.getElementById("metricPrimary").textContent = percent(data.watermarked.bit_accuracy);
       document.getElementById("metricPrimaryLabel").textContent = "watermarked bit match";
-      document.getElementById("metricSecondary").textContent = percent(data.clean.bit_accuracy || 0);
-      document.getElementById("metricSecondaryLabel").textContent = "clean bit match";
+      document.getElementById("metricSecondary").textContent = `${data.resolution[0]}x${data.resolution[1]}`;
+      document.getElementById("metricSecondaryLabel").textContent = "input resolution";
       document.getElementById("metricTertiary").textContent = data.watermark_rmse;
       document.getElementById("metricTertiaryLabel").textContent = "watermark RMSE";
 
       const scoreList = document.getElementById("scoreList");
       scoreList.innerHTML = "";
       [
-        ["Clean", data.clean.bit_accuracy || 0],
         ["Watermarked", data.watermarked.bit_accuracy],
-        ["MP4 readback", data.watermarked_mp4_readback.bit_accuracy || 0],
       ].forEach(([label, score]) => {
         const row = document.createElement("div");
         row.className = "score-row";
