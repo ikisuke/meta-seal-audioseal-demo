@@ -53,7 +53,7 @@ uv run audioseal-web --port 8777
 
 Each web run is written into `outputs/web/` with media files and `results.json`.
 The video path runs VideoSeal on CPU, so the first run can be slow while the
-model loads. The web app uses a short 16:9 sample, the default low-strength
+model loads. The web app uses a short 16:9 sample, a quality-first low-strength
 VideoSeal setting, and skips the heavier MP4 readback detector by default to
 keep the UI usable and preserve visual quality.
 

@@ -36,7 +36,8 @@ from .cli import (
 APP_DIR = Path(__file__).resolve().parents[2]
 WEB_OUTPUT_DIR = APP_DIR / "outputs" / "web"
 MAX_UPLOAD_SECONDS = 20
-VIDEO_WATERMARK_STRENGTH = 0.2
+VIDEO_WATERMARK_MODE = "quality"
+VIDEO_WATERMARK_STRENGTH = 0.05
 _GENERATOR: torch.nn.Module | None = None
 _DETECTOR: torch.nn.Module | None = None
 _VIDEO_MODEL: torch.nn.Module | None = None
@@ -220,6 +221,7 @@ def process_video_tensor(video: torch.Tensor, label: str) -> dict[str, Any]:
         "run_id": run_id,
         "frame_count": int(video.shape[0]),
         "resolution": [int(video.shape[-1]), int(video.shape[-2])],
+        "video_mode": VIDEO_WATERMARK_MODE,
         "video_scaling_w": VIDEO_WATERMARK_STRENGTH,
         "message_bits": target_message.detach().cpu().int().tolist(),
         "watermark_rmse": round(float(l2_delta), 6),
@@ -789,8 +791,8 @@ HTML = """
       document.getElementById("metricPrimaryLabel").textContent = "watermarked bit match";
       document.getElementById("metricSecondary").textContent = `${data.resolution[0]}x${data.resolution[1]}`;
       document.getElementById("metricSecondaryLabel").textContent = "input resolution";
-      document.getElementById("metricTertiary").textContent = data.watermark_rmse;
-      document.getElementById("metricTertiaryLabel").textContent = "watermark RMSE";
+      document.getElementById("metricTertiary").textContent = data.video_mode || "quality";
+      document.getElementById("metricTertiaryLabel").textContent = `strength ${data.video_scaling_w}`;
 
       const scoreList = document.getElementById("scoreList");
       scoreList.innerHTML = "";
