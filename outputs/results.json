@@ -1,0 +1,142 @@
+{
+  "environment": {
+    "torch": "2.12.0+cpu",
+    "cuda_available": false,
+    "no_torch_compile": "1",
+    "sample_rate": 16000
+  },
+  "message_bits": [
+    1,
+    0,
+    1,
+    0,
+    1,
+    0,
+    1,
+    0,
+    1,
+    1,
+    0,
+    0,
+    1,
+    1,
+    0,
+    0
+  ],
+  "watermark_snr_db": 46.583,
+  "clean": {
+    "score": 0.163237,
+    "positive_frame_ratio_over_0_5": 0.163237,
+    "positive_frame_mean": 0.236322,
+    "decoded_message": [
+      1,
+      1,
+      1,
+      0,
+      0,
+      0,
+      0,
+      1,
+      1,
+      1,
+      0,
+      0,
+      0,
+      1,
+      1,
+      1
+    ]
+  },
+  "watermarked": {
+    "score": 1.0,
+    "positive_frame_ratio_over_0_5": 1.0,
+    "positive_frame_mean": 0.999733,
+    "decoded_message": [
+      1,
+      0,
+      1,
+      0,
+      1,
+      0,
+      1,
+      0,
+      1,
+      1,
+      0,
+      0,
+      1,
+      1,
+      0,
+      0
+    ]
+  },
+  "watermarked_plus_30db_noise": {
+    "score": 0.663763,
+    "positive_frame_ratio_over_0_5": 0.663763,
+    "positive_frame_mean": 0.64883,
+    "decoded_message": [
+      1,
+      0,
+      1,
+      0,
+      0,
+      0,
+      1,
+      0,
+      1,
+      1,
+      0,
+      0,
+      1,
+      1,
+      1,
+      0
+    ]
+  },
+  "watermarked_resampled_16k_to_8k_to_16k": {
+    "score": 1.0,
+    "positive_frame_ratio_over_0_5": 1.0,
+    "positive_frame_mean": 0.99975,
+    "decoded_message": [
+      1,
+      0,
+      1,
+      0,
+      1,
+      0,
+      1,
+      0,
+      1,
+      1,
+      0,
+      0,
+      1,
+      1,
+      0,
+      0
+    ]
+  },
+  "watermarked_center_crop_3s": {
+    "score": 0.969854,
+    "positive_frame_ratio_over_0_5": 0.969854,
+    "positive_frame_mean": 0.965832,
+    "decoded_message": [
+      1,
+      0,
+      1,
+      0,
+      1,
+      0,
+      1,
+      0,
+      1,
+      1,
+      0,
+      0,
+      1,
+      1,
+      0,
+      0
+    ]
+  }
+}
